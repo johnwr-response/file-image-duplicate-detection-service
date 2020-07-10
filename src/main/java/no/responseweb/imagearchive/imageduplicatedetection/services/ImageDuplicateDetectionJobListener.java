@@ -2,64 +2,97 @@ package no.responseweb.imagearchive.imageduplicatedetection.services;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import no.responseweb.imagearchive.filestoredbservice.services.FileEntityService;
+import no.responseweb.imagearchive.filestoredbservice.services.FileItemService;
 import no.responseweb.imagearchive.imageduplicatedetection.config.JmsConfig;
+import no.responseweb.imagearchive.model.FileEntityDto;
+import no.responseweb.imagearchive.model.FileItemDto;
+import no.responseweb.imagearchive.model.ImageDuplicateComparisonDto;
 import no.responseweb.imagearchive.model.ImageDuplicateDetectionJobDto;
 import org.springframework.jms.annotation.JmsListener;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
 
-import javax.imageio.ImageIO;
-import java.awt.image.BufferedImage;
-import java.io.ByteArrayInputStream;
-import java.io.IOException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Slf4j
 @RequiredArgsConstructor
 @Component
+@Transactional
 public class ImageDuplicateDetectionJobListener {
 
-    private final FileStoreFetcherService fileStoreFetcherService;
+    private final ImageDuplicateComparisonService imageDuplicateComparisonService;
+
+    private final FileEntityService fileEntityService;
+    private final FileItemService fileItemService;
 
     @JmsListener(destination = JmsConfig.IMAGE_DUPLICATE_DETECTION_JOB_QUEUE)
-    public void listen(ImageDuplicateDetectionJobDto imageDuplicateDetectionJobDto) throws IOException {
+    public void listen(ImageDuplicateDetectionJobDto imageDuplicateDetectionJobDto) {
         log.info("Called with: {}", imageDuplicateDetectionJobDto);
-        if (imageDuplicateDetectionJobDto.getFileItemIdQuery()!=null) {
-            byte[] downloadedBytesQuery = fileStoreFetcherService.fetchFile(imageDuplicateDetectionJobDto.getFileItemIdQuery());
-            BufferedImage imageQuery = ImageIO.read(new ByteArrayInputStream(downloadedBytesQuery));
-            if (imageQuery!=null) {
-                // get dHash of all images in dataset
-
-/*
-Consider using Lire:
-https://github.com/dermotte/lire
-
-openimaj approach:
-                MBFImage query = ImageUtilities.readMBF(new ByteArrayInputStream(downloadedBytesQuery));
-                MBFImage target = ImageUtilities.readMBF(new ByteArrayInputStream(downloadedBytesTarget));
-
-                DoGSIFTEngine engine = new DoGSIFTEngine();
-                LocalFeatureList<Keypoint> queryKeypoints = engine.findFeatures(query.flatten());
-                LocalFeatureList<Keypoint> targetKeypoints = engine.findFeatures(target.flatten());
-
-                LocalFeatureMatcher<Keypoint> matcher = new BasicMatcher<Keypoint>(80);
-                matcher.setModelFeatures(queryKeypoints);
-                matcher.findMatches(targetKeypoints);
-
-                MBFImage basicMatches = MatchingUtilities.drawMatches(query, target, matcher.getMatches(), RGBColour.RED);
-                DisplayUtilities.display(basicMatches);
-
-                RobustAffineTransformEstimator modelFitter = new RobustAffineTransformEstimator(50.0, 1500,
-                        new RANSAC.PercentageInliersStoppingCondition(0.5));
-                matcher = new ConsistentLocalFeatureMatcher2d<Keypoint>(
-                        new FastBasicKeypointMatcher<Keypoint>(8), modelFitter);
-
-                matcher.setModelFeatures(queryKeypoints);
-                matcher.findMatches(targetKeypoints);
-
-                MBFImage consistentMatches = MatchingUtilities.drawMatches(query, target, matcher.getMatches(),
-                        RGBColour.RED);
-*/
+        FileItemDto fileItemDto = imageDuplicateDetectionJobDto.getFileItemDto();
+        if (fileItemDto!=null && fileItemDto.getId()!=null) {
+            FileEntityDto fetchedFileEntity = fileEntityService.findFirstById(fileItemDto.getId());
+            AtomicInteger iCount = new AtomicInteger();
+            AtomicBoolean bFound = new AtomicBoolean(false);
+            fileEntityService.findDistinctByIdNotLike(fileItemDto.getId()).forEach(compareWithFileEntityDto -> {
+                iCount.getAndIncrement();
+                if (compareWithFileEntityDto.getId()!=null) {
+                    log.info("Check if {} is duplicate of {}", fileItemDto.getId(), compareWithFileEntityDto.getId());
+                    ImageDuplicateComparisonDto comparisonDto = imageDuplicateComparisonService.compareFiles(
+                            (fetchedFileEntity!=null) ? fetchedFileEntity.getId() : fileItemDto.getId(),
+                            compareWithFileEntityDto.getId()
+                    );
+                    log.info("{}", comparisonDto);
+                    if (comparisonDto.score() > ((fileItemDto.getFileEntityScore() != null) ? fileItemDto.getFileEntityScore() : 0)) {
+                        bFound.set(true);
+                        fileItemDto.setFileEntityScore(comparisonDto.score());
+                        if (comparisonDto.identical()) {
+                            log.info("Image {} is identical. Score: {}", compareWithFileEntityDto, comparisonDto.score());
+                            fileItemDto.setFileEntityId(compareWithFileEntityDto.getId());
+                            markFileAsDuplicate(fileItemDto);
+                        } else if (comparisonDto.probable()){
+                            log.info("Image {} is probable for duplication. Score: {}", compareWithFileEntityDto, comparisonDto.score());
+                            fileItemDto.setFileEntityId(compareWithFileEntityDto.getId());
+                            markFileAsDuplicateCandidate(fileItemDto);
+                        } else if (comparisonDto.candidate()){
+                            log.info("Image {} is candidate for duplication. Score: {}", compareWithFileEntityDto, comparisonDto.score());
+                            markFileAsDuplicateCandidate(fileItemDto);
+                        } else {
+                            log.info("Image {} is NOT candidate for duplication. Score: {}", compareWithFileEntityDto, comparisonDto.score());
+                        }
+                    }
+                }
+            });
+            if (!bFound.get()) {
+                markFileAsNewEntity(fileItemDto);
+            }
+        }
+    }
+    private void markFileAsDuplicate(FileItemDto fileItemDto) {
+        if (fileItemDto!=null) {
+            fileEntityService.deleteById(fileItemDto.getId());
+            fileItemService.save(fileItemDto);
+            log.info("File marked as duplicate!");
+        }
+    }
+    private void markFileAsDuplicateCandidate(FileItemDto fileItemDto) {
+        if (fileItemDto!=null) {
+            // TODO: Implement this. New mapping table?
+            // For now just mark it as duplicate
+            markFileAsDuplicate(fileItemDto);
+        }
+    }
+    private void markFileAsNewEntity(FileItemDto fileItemDto) {
+        if (fileItemDto!=null) {
+            FileEntityDto fileEntityDto = fileEntityService.findFirstById(fileItemDto.getId());
+            if (fileItemDto.getFileEntityId()==null && fileEntityDto==null) {
+                fileEntityDto = fileEntityService.save(FileEntityDto.builder().id(fileItemDto.getId()).build());
+                fileItemDto.setFileEntityId(fileEntityDto.getId());
+                fileItemService.save(fileItemDto);
             }
 
+            log.info("File marked as new entity!");
         }
     }
 }
