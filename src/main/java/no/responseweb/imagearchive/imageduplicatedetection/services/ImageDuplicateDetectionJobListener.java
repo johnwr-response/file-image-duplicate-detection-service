@@ -4,11 +4,10 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import no.responseweb.imagearchive.filestoredbservice.services.FileEntityService;
 import no.responseweb.imagearchive.filestoredbservice.services.FileItemService;
+import no.responseweb.imagearchive.filestoredbservice.services.MediaTypeService;
 import no.responseweb.imagearchive.imageduplicatedetection.config.JmsConfig;
-import no.responseweb.imagearchive.model.FileEntityDto;
-import no.responseweb.imagearchive.model.FileItemDto;
-import no.responseweb.imagearchive.model.ImageDuplicateComparisonDto;
-import no.responseweb.imagearchive.model.ImageDuplicateDetectionJobDto;
+import no.responseweb.imagearchive.model.*;
+import org.springframework.http.MediaType;
 import org.springframework.jms.annotation.JmsListener;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
@@ -23,9 +22,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class ImageDuplicateDetectionJobListener {
 
     private final ImageDuplicateComparisonService imageDuplicateComparisonService;
+    private final FileStoreFetcherService fileStoreFetcherService;
 
     private final FileEntityService fileEntityService;
     private final FileItemService fileItemService;
+    private final MediaTypeService mediaTypeService;
 
     @JmsListener(destination = JmsConfig.IMAGE_DUPLICATE_DETECTION_JOB_QUEUE)
     public void listen(ImageDuplicateDetectionJobDto imageDuplicateDetectionJobDto) {
@@ -65,7 +66,12 @@ public class ImageDuplicateDetectionJobListener {
                 }
             });
             if (!bFound.get()) {
-                markFileAsNewEntity(fileItemDto);
+                markFileAsNewEntity(
+                        fileItemDto,
+                        fetchMediaTypeDto(MediaType.parseMediaType(
+                                fileStoreFetcherService.getMimeType(fileItemDto.getId()))
+                        )
+                );
             }
         }
     }
@@ -83,16 +89,29 @@ public class ImageDuplicateDetectionJobListener {
             markFileAsDuplicate(fileItemDto);
         }
     }
-    private void markFileAsNewEntity(FileItemDto fileItemDto) {
+    private void markFileAsNewEntity(FileItemDto fileItemDto, MediaTypeDto mediaTypeDto) {
         if (fileItemDto!=null) {
             FileEntityDto fileEntityDto = fileEntityService.findFirstById(fileItemDto.getId());
             if (fileItemDto.getFileEntityId()==null && fileEntityDto==null) {
-                fileEntityDto = fileEntityService.save(FileEntityDto.builder().id(fileItemDto.getId()).build());
+                fileEntityDto = fileEntityService.save(FileEntityDto.builder()
+                        .id(fileItemDto.getId())
+                        .mediaTypeId(mediaTypeDto.getId())
+                        .build());
                 fileItemDto.setFileEntityId(fileEntityDto.getId());
                 fileItemService.save(fileItemDto);
             }
 
             log.info("File marked as new entity!");
         }
+    }
+    private MediaTypeDto fetchMediaTypeDto(MediaType mediaType) {
+        if (mediaType==null) return null;
+        MediaTypeDto mediaTypeDto = mediaTypeService.findFirstByTypeAndSubtype(mediaType.getType(), mediaType.getSubtype());
+        return (mediaTypeDto!=null) ? mediaTypeDto : mediaTypeService.save(
+                MediaTypeDto.builder()
+                        .type(mediaType.getType())
+                        .subtype(mediaType.getSubtype())
+                        .build()
+        );
     }
 }
